@@ -14,6 +14,7 @@ import {
 	connect,
 	destroy,
 	execute,
+	executeAsStream,
 	getConnectionOptions,
 	type SnowflakeCredential,
 } from './GenericFunctions';
@@ -88,6 +89,18 @@ export class Snowflake implements INodeType {
 				placeholder: 'SELECT id, name FROM product WHERE id < 40',
 				required: true,
 				description: 'The SQL query to execute',
+			},
+			{
+				displayName: 'Stream Results',
+				name: 'streamResults',
+				type: 'boolean',
+				displayOptions: {
+					show: {
+						operation: ['executeQuery'],
+					},
+				},
+				default: false,
+				description: 'Whether to stream the query results instead of loading them into memory',
 			},
 
 			// ----------------------------------
@@ -181,6 +194,15 @@ export class Snowflake implements INodeType {
 		const items = this.getInputData();
 		const operation = this.getNodeParameter('operation', 0);
 
+		const appendExecutionData = (executionData: INodeExecutionData[]) => {
+			if (!executionData.length) return;
+
+			const chunkSize = 1000;
+			for (let startIndex = 0; startIndex < executionData.length; startIndex += chunkSize) {
+				returnData.push(...executionData.slice(startIndex, startIndex + chunkSize));
+			}
+		};
+
 		if (operation === 'executeQuery') {
 			// ----------------------------------
 			//         executeQuery
@@ -193,12 +215,34 @@ export class Snowflake implements INodeType {
 					query = query.replace(resolvable, this.evaluateExpression(resolvable, i) as string);
 				}
 
+				const streamResults = this.getNodeParameter('streamResults', i) as boolean;
+
+				if (streamResults) {
+					const resultStream = await executeAsStream(connection, query, []);
+					const binaryData = await this.helpers.prepareBinaryData(
+						resultStream,
+						`snowflake-query-${i + 1}.ndjson`,
+						'application/x-ndjson',
+					);
+					const executionData = this.helpers.constructExecutionMetaData(
+						[
+							{
+								json: { query, streamResults: true },
+								binary: { data: binaryData },
+							},
+						],
+						{ itemData: { item: i } },
+					);
+					appendExecutionData(executionData);
+					continue;
+				}
+
 				const responseData = await execute(connection, query, []);
 				const executionData = this.helpers.constructExecutionMetaData(
 					this.helpers.returnJsonArray(responseData as IDataObject[]),
 					{ itemData: { item: i } },
 				);
-				returnData.push(...executionData);
+				appendExecutionData(executionData);
 			}
 		}
 
@@ -221,7 +265,7 @@ export class Snowflake implements INodeType {
 					this.helpers.returnJsonArray(d),
 					{ itemData: { item: i } },
 				);
-				returnData.push(...executionData);
+				appendExecutionData(executionData);
 			});
 		}
 
@@ -252,7 +296,7 @@ export class Snowflake implements INodeType {
 					this.helpers.returnJsonArray(d),
 					{ itemData: { item: i } },
 				);
-				returnData.push(...executionData);
+				appendExecutionData(executionData);
 			});
 		}
 

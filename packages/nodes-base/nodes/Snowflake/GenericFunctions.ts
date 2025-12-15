@@ -1,6 +1,7 @@
 import { createPrivateKey } from 'crypto';
 import pick from 'lodash/pick';
 import type snowflake from 'snowflake-sdk';
+import { Readable, Transform } from 'stream';
 
 import { formatPrivateKey } from '@utils/utilities';
 
@@ -84,5 +85,46 @@ export async function execute(
 			binds,
 			complete: (error, _, rows) => (error ? reject(error) : resolve(rows)),
 		});
+	});
+}
+
+export async function executeAsStream(
+	conn: snowflake.Connection,
+	sqlText: string,
+	binds: snowflake.InsertBinds,
+) {
+	return await new Promise<Readable>((resolve, reject) => {
+		let rowStream: Readable;
+		const statement = conn.execute({
+			sqlText,
+			binds,
+			streamResult: true,
+			complete: (error) => {
+				if (error) {
+					if (!rowStream) reject(error);
+					rowStream?.destroy(error);
+				}
+			},
+		});
+
+		rowStream = statement.streamRows();
+
+		rowStream.once('error', (error) => reject(error));
+
+		const jsonlStream = new Transform({
+			objectMode: true,
+			transform(chunk, _encoding, callback) {
+				try {
+					callback(null, `${JSON.stringify(chunk)}\n`);
+				} catch (error) {
+					callback(error as Error);
+				}
+			},
+		});
+
+		jsonlStream.once('error', (error) => rowStream.destroy(error));
+		rowStream.pipe(jsonlStream);
+
+		resolve(jsonlStream);
 	});
 }

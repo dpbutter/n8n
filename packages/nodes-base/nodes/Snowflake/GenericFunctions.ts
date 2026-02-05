@@ -4,6 +4,8 @@ import type snowflake from 'snowflake-sdk';
 
 import { formatPrivateKey } from '@utils/utilities';
 
+import type { IDataObject } from 'n8n-workflow';
+
 const commonConnectionFields = [
 	'account',
 	'database',
@@ -18,6 +20,7 @@ export type SnowflakeCredential = Pick<
 	(typeof commonConnectionFields)[number]
 > &
 	(
+		// Built-in snowflake credential options
 		| {
 				authentication: 'password';
 				username?: string;
@@ -29,6 +32,17 @@ export type SnowflakeCredential = Pick<
 				privateKey: string;
 				passphrase?: string;
 		  }
+		| { // Snowflake OAuth2 credential
+				grantType: string;
+				authUrl: string;
+				accessTokenUrl: string;
+				clientId: string;
+				clientSecret: string;
+				scope: string;
+				authQueryParameters: string;
+				authentication: 'Header' | 'Body';
+				oauthTokenData: IDataObject;
+			}
 	);
 
 const extractPrivateKey = (credential: { privateKey: string; passphrase?: string }) => {
@@ -49,14 +63,23 @@ const extractPrivateKey = (credential: { privateKey: string; passphrase?: string
 };
 
 export const getConnectionOptions = (credential: SnowflakeCredential) => {
+	// Grab the common connection field values
 	const connectionOptions: snowflake.ConnectionOptions = pick(credential, commonConnectionFields);
-	if (credential.authentication === 'keyPair') {
-		connectionOptions.authenticator = 'SNOWFLAKE_JWT';
-		connectionOptions.username = credential.username;
-		connectionOptions.privateKey = extractPrivateKey(credential);
+
+	if ('oauthTokenData' in credential) {
+		// Snowflake OAuth2 credential
+		connectionOptions.authenticator =  'OAUTH';
+		connectionOptions.token = credential.oauthTokenData.access_token as string;
 	} else {
-		connectionOptions.username = credential.username;
-		connectionOptions.password = credential.password;
+		// Standard Snowflake credential
+		if (credential.authentication === 'keyPair') {
+			connectionOptions.authenticator = 'SNOWFLAKE_JWT';
+			connectionOptions.username = credential.username;
+			connectionOptions.privateKey = extractPrivateKey(credential);
+		} else { // credential.authentication === 'password'
+			connectionOptions.username = credential.username;
+			connectionOptions.password = credential.password;
+		}
 	}
 	return connectionOptions;
 };
@@ -83,6 +106,32 @@ export async function execute(
 			sqlText,
 			binds,
 			complete: (error, _, rows) => (error ? reject(error) : resolve(rows)),
+		});
+	});
+}
+
+export async function executeStream(
+	conn: snowflake.Connection,
+	sqlText: string,
+	binds: snowflake.InsertBinds,
+	onRow: (row: any) => void,
+) {
+	return await new Promise<void>((resolve, reject) => {
+		conn.execute({
+			sqlText,
+			binds,
+			streamResult: true,
+			complete: (error, stmt) => {
+				if (error) {
+					reject(error);
+				} else {
+					// Don't resolve here - let the stream end event handle it
+					stmt.streamRows()
+						.on('data', onRow)
+						.on('error', reject)
+						.on('end', resolve);
+				}
+			},
 		});
 	});
 }

@@ -7,16 +7,20 @@ import type {
 } from 'n8n-workflow';
 import { NodeConnectionTypes } from 'n8n-workflow';
 import snowflake from 'snowflake-sdk';
+import { Readable } from 'stream';
 
 import { getResolvables } from '@utils/utilities';
+
 
 import {
 	connect,
 	destroy,
 	execute,
+	executeStream,
 	getConnectionOptions,
 	type SnowflakeCredential,
 } from './GenericFunctions';
+
 
 export class Snowflake implements INodeType {
 	description: INodeTypeDescription = {
@@ -35,11 +39,28 @@ export class Snowflake implements INodeType {
 		parameterPane: 'wide',
 		credentials: [
 			{
+				name: 'snowflakeOAuth2Api',
+				required: false,
+				displayOptions: { show: { authType: ['snowflakeOAuth2Api'] } },
+			},
+			{
 				name: 'snowflake',
 				required: true,
-			},
+				displayOptions: { show: { authType: ['snowflake'] } },
+			}
 		],
 		properties: [
+			{
+				displayName: 'Authentication Method',
+				name: 'authType',
+				type: 'options',
+				options: [
+					{ name: 'OAuth2', value: 'snowflakeOAuth2Api' },
+					{ name: 'Key Pair', value: 'snowflake' },
+				],
+				default: 'snowflakeOAuth2Api',
+			},
+
 			{
 				displayName: 'Operation',
 				name: 'operation',
@@ -88,6 +109,30 @@ export class Snowflake implements INodeType {
 				placeholder: 'SELECT id, name FROM product WHERE id < 40',
 				required: true,
 				description: 'The SQL query to execute',
+			},
+			{
+				displayName: 'Output Format',
+				name: 'outputFormat',
+				type: 'options',
+				displayOptions: {
+					show: {
+						operation: ['executeQuery'],
+					},
+				},
+				options: [
+					{
+						name: 'JSON (Items)',
+						value: 'json',
+						description: 'Return results as JSON items',
+					},
+					{
+						name: 'CSV File',
+						value: 'csv',
+						description: 'Stream results to CSV file',
+					},
+				],
+				default: 'json',
+				description: 'Format for query results',
 			},
 
 			// ----------------------------------
@@ -170,9 +215,19 @@ export class Snowflake implements INodeType {
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-		const credentials = await this.getCredentials<SnowflakeCredential>('snowflake');
+		const authType = this.getNodeParameter('authType', 0) as string;
+		const credentials = await this.getCredentials<SnowflakeCredential>(authType);
 
-		const connectionOptions = getConnectionOptions(credentials);
+		/*
+		// Debug: Let's see what we actually got
+		console.log('=== CREDENTIAL DEBUG ===');
+		console.log('Available credential properties:', Object.keys(credentials));
+		console.log('Full credential object:', JSON.stringify(credentials, null, 2));
+		console.log('Account field:', credentials.account);
+		console.log('========================');
+		*/
+
+		let connectionOptions = getConnectionOptions(credentials);
 		const connection = snowflake.createConnection(connectionOptions);
 
 		await connect(connection);
@@ -188,17 +243,81 @@ export class Snowflake implements INodeType {
 
 			for (let i = 0; i < items.length; i++) {
 				let query = this.getNodeParameter('query', i) as string;
+				const outputFormat = this.getNodeParameter('outputFormat', i, 'json') as string;
 
 				for (const resolvable of getResolvables(query)) {
 					query = query.replace(resolvable, this.evaluateExpression(resolvable, i) as string);
 				}
 
-				const responseData = await execute(connection, query, []);
-				const executionData = this.helpers.constructExecutionMetaData(
-					this.helpers.returnJsonArray(responseData as IDataObject[]),
-					{ itemData: { item: i } },
-				);
-				returnData.push(...executionData);
+				if (outputFormat === 'csv') {
+					// Stream results to CSV using Readable stream (memory-efficient)
+					let headers: string[] | null = null;
+					let rowCount = 0;
+					let streamError: Error | null = null;
+
+					// Create a readable stream that will be populated as rows arrive
+					const csvStream = new Readable({
+						read() {
+							// No-op: data will be pushed from the executeStream callback
+						},
+					});
+
+					// Start streaming query results (don't await - let prepareBinaryData consume)
+					const streamPromise = executeStream(connection, query, [], (row) => {
+						if (!headers) {
+							// First row - extract headers
+							headers = Object.keys(row);
+							const headerLine = headers.map(h => `"${h}"`).join(',') + '\n';
+							csvStream.push(headerLine);
+						}
+						// Add data row
+						const values = headers!.map(h => {
+							const val = row[h];
+							if (val === null || val === undefined) return '';
+							if (typeof val === 'string') return `"${val.replace(/"/g, '""')}"`;
+							return String(val);
+						});
+						csvStream.push(values.join(',') + '\n');
+						rowCount++;
+					}).then(() => {
+						// Signal end of stream when all rows are processed
+						csvStream.push(null);
+					}).catch((error) => {
+						streamError = error;
+						csvStream.destroy(error);
+					});
+
+					// Prepare binary data from the stream (n8n will handle storage efficiently)
+					// This will consume the stream as data becomes available
+					const binaryData = await this.helpers.prepareBinaryData(
+						csvStream,
+						'query_results.csv',
+						'text/csv',
+					);
+
+					// Ensure streaming completed without error
+					await streamPromise;
+					if (streamError) {
+						throw streamError;
+					}
+
+					returnData.push({
+						json: { rowCount, message: `Exported ${rowCount} rows to CSV` },
+						binary: { data: binaryData },
+						pairedItem: { item: i },
+					});
+				} else {
+					// JSON output (original behavior)
+					const responseData = await execute(connection, query, []);
+					const executionData = this.helpers.constructExecutionMetaData(
+						this.helpers.returnJsonArray(responseData as IDataObject[]),
+						{ itemData: { item: i } },
+					);
+					// Append items individually to avoid memory issues with large result sets
+					for (const item of executionData) {
+						returnData.push(item);
+					}
+				}
 			}
 		}
 

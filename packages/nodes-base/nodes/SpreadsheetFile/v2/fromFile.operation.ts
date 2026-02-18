@@ -115,10 +115,15 @@ export async function execute(
 				const skipRecordsWithErrors = options.skipRecordsWithErrors?.value?.enabled;
 				const csvOptions: CSVOptions = {
 					delimiter: options.delimiter,
-					fromLine: options.fromLine,
+					from: options.fromLine,
 					encoding: options.encoding,
 					bom: options.enableBOM,
-					to: maxRowCount > -1 ? maxRowCount : undefined,
+					to:
+						maxRowCount > -1
+							? options.fromLine
+								? maxRowCount + options.fromLine - 1
+								: maxRowCount
+							: undefined,
 					skip_records_with_error: skipRecordsWithErrors,
 					columns: options.headerRow !== false,
 					relax_quotes: options.relaxQuotes,
